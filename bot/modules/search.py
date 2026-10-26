@@ -1,6 +1,8 @@
 from httpx import AsyncClient
 from html import escape
 from urllib.parse import quote
+from asyncio import sleep
+from time import time
 
 from .. import LOGGER
 from ..core.config_manager import Config
@@ -28,7 +30,7 @@ async def initiate_search_tools():
     if Config.SEARCH_API_LINK:
         global SITES
         try:
-            async with AsyncClient() as client:
+            async with AsyncClient(timeout=60) as client:
                 response = await client.get(f"{Config.SEARCH_API_LINK}/api/v1/sites")
                 data = response.json()
             SITES = {
@@ -63,14 +65,15 @@ async def search(key, site, message, method):
             else:
                 api = f"{Config.SEARCH_API_LINK}/api/v1/recent?site={site}&limit={Config.SEARCH_LIMIT}"
         try:
-            async with AsyncClient() as client:
+            async with AsyncClient(timeout=60) as client:
                 response = await client.get(api)
                 search_results = response.json()
             if "error" in search_results or search_results["total"] == 0:
-                await edit_message(
-                    message,
-                    f"No result found for <i>{key}</i>\nTorrent Site:- <i>{SITES.get(site)}</i>",
-                )
+                reason = search_results.get("error")
+                no_result = f"No result found for <i>{key}</i>\nTorrent Site:- <i>{SITES.get(site)}</i>"
+                if reason:
+                    no_result += f"\n<i>({escape(str(reason))})</i>"
+                await edit_message(message, no_result)
                 return
             msg = f"<b>Found {min(search_results['total'], TELEGRAPH_LIMIT)}</b>"
             if method == "apitrend":
@@ -83,7 +86,7 @@ async def search(key, site, message, method):
                 msg += f" <b>result(s) for <i>{key}</i>\nTorrent Site:- <i>{SITES.get(site)}</i></b>"
             search_results = search_results["data"]
         except Exception as e:
-            await edit_message(message, str(e))
+            await edit_message(message, str(e) or type(e).__name__)
             return
     else:
         LOGGER.info(f"PLUGINS Searching: {key} from {site}")
@@ -91,16 +94,36 @@ async def search(key, site, message, method):
             pattern=key, plugins=[site], category="all"
         )
         search_id = search.id
+        # Stall-breaker: return as soon as live plugins stop adding results.
+        # Dead/CF-blocked plugins never finish alone; a hard deadline plus a
+        # no-growth stall cut stops the job and keeps what reachable found.
+        deadline = time() + 15
+        last_total, stall = -1, 0
         while True:
             result_status = await TorrentManager.qbittorrent.search.status(search_id)
             status = result_status[0].status
             if status != "Running":
                 break
+            if time() >= deadline:
+                await TorrentManager.qbittorrent.search.stop(search_id)
+                break
+            poll = await TorrentManager.qbittorrent.search.results(
+                id=search_id, limit=1
+            )
+            if poll.total == last_total:
+                stall += 1
+                if stall >= 3:
+                    await TorrentManager.qbittorrent.search.stop(search_id)
+                    break
+            else:
+                last_total, stall = poll.total, 0
+            await sleep(1.5)
         dict_search_results = await TorrentManager.qbittorrent.search.results(
             id=search_id, limit=TELEGRAPH_LIMIT
         )
         search_results = dict_search_results.results
         total_results = dict_search_results.total
+        await TorrentManager.qbittorrent.search.delete(search_id)
         if total_results == 0:
             await edit_message(
                 message,
@@ -109,7 +132,6 @@ async def search(key, site, message, method):
             return
         msg = f"<b>Found {min(total_results, TELEGRAPH_LIMIT)}</b>"
         msg += f" <b>result(s) for <i>{key}</i>\nTorrent Site:- <i>{site.capitalize()}</i></b>"
-        await TorrentManager.qbittorrent.search.delete(search_id)
     link = await get_result(search_results, key, message, method)
     buttons = ButtonMaker()
     buttons.url_button("🔎 VIEW", link)
